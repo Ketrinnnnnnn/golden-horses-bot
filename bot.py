@@ -5,6 +5,7 @@ import csv
 import json
 import logging
 import uuid
+import re
 from datetime import datetime, date
 from pathlib import Path
 from typing import Dict, Any, List
@@ -14,6 +15,9 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -48,6 +52,11 @@ BOOKINGS_FILE = DATA_DIR / "bookings.json"
 HORSES_FILE = DATA_DIR / "horses.csv"
 INSTRUCTORS_FILE = DATA_DIR / "instructors.csv"
 
+MAX_WEIGHT = 105
+WEIGHT_THRESHOLD = 95
+MIN_HEIGHT_FOR_HEAVY = 175
+CONTACT_PHONE = "+7 911 100-9-100"
+
 # =========================
 # Состояния
 # =========================
@@ -67,9 +76,7 @@ INSTRUCTORS_FILE = DATA_DIR / "instructors.csv"
     NAME,
     PHONE,
     CONFIRM,
-    HORSE_SEARCH,
-    INSTRUCTOR_SEARCH,
-) = range(16)
+) = range(14)
 
 # =========================
 # Услуги
@@ -128,11 +135,10 @@ def get_user_bookings(user_id: int) -> List[Dict[str, Any]]:
 
 
 # =========================
-# Загрузка CSV
+# CSV
 # =========================
 
 def load_horses() -> List[Dict[str, str]]:
-    """Загружает лошадей из data/horses.csv."""
     try:
         with open(HORSES_FILE, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -141,18 +147,7 @@ def load_horses() -> List[Dict[str, str]]:
         return []
 
 
-def find_horse_by_name(query: str) -> List[Dict[str, str]]:
-    """Ищет лошадей по имени или породе."""
-    horses = load_horses()
-    q = query.lower().strip()
-    return [
-        h for h in horses
-        if q in h.get("name", "").lower() or q in h.get("breed", "").lower()
-    ]
-
-
 def find_horse_for_weight(weight: int) -> List[Dict[str, str]]:
-    """Возвращает лошадей, подходящих по весу."""
     horses = load_horses()
     result = []
     for h in horses:
@@ -165,24 +160,12 @@ def find_horse_for_weight(weight: int) -> List[Dict[str, str]]:
 
 
 def load_instructors() -> List[Dict[str, str]]:
-    """Загружает инструкторов из data/instructors.csv."""
     try:
         with open(INSTRUCTORS_FILE, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             return [row for row in reader if row.get("name")]
     except (FileNotFoundError, OSError):
         return []
-
-
-def find_instructor_by_specialization(query: str) -> List[Dict[str, str]]:
-    """Ищет инструкторов по специализации."""
-    instructors = load_instructors()
-    q = query.lower().strip()
-    return [
-        i for i in instructors
-        if q in i.get("specialization", "").lower()
-    ]
-
 
 # =========================
 # Расчёт цены
@@ -269,6 +252,14 @@ def confirm_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_yes")],
         [InlineKeyboardButton("❌ Отменить", callback_data="confirm_no")],
     ])
+
+
+def phone_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Отправить номер телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 # =========================
@@ -413,6 +404,15 @@ def booking_summary(booking: Dict[str, Any]) -> str:
     )
 
 
+def is_valid_name(name: str) -> bool:
+    """Проверяет, что имя состоит только из букв и имеет длину 2-50 символов."""
+    name = name.strip()
+    if not (2 <= len(name) <= 50):
+        return False
+    # Только буквы (русские или латинские), дефис, пробел
+    pattern = r"^[А-Яа-яЁёA-Za-z\- ]+$"
+    return bool(re.match(pattern, name))
+
 # =========================
 # Команды
 # =========================
@@ -463,10 +463,6 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.message.reply_text("⚠️ Данные временно недоступны.")
             return
         await query.message.reply_text(format_horses_list(horses), parse_mode="Markdown")
-        await query.message.reply_text(
-            "🔍 Хотите найти конкретную лошадь? Введите имя или породу:",
-        )
-        context.user_data["search_horse"] = True
         return
 
     if data == "menu_instructors":
@@ -666,17 +662,34 @@ async def weight_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Введите реалистичный вес в килограммах.")
         return PERSON_WEIGHT
 
+    # Проверка максимального веса
+    if weight > MAX_WEIGHT:
+        await update.message.reply_text(
+            f"⚠️ К сожалению, мы не можем записать вас на прогулку.\n\n"
+            f"Максимальный вес всадника — {MAX_WEIGHT} кг.\n\n"
+            f"📞 Позвоните нам по номеру {CONTACT_PHONE} —\n"
+            f"мы подберём для вас подходящую лошадь или предложим\n"
+            f"альтернативный формат отдыха.",
+            reply_markup=main_menu(),
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
     booking = context.user_data.setdefault("booking", {})
     current = booking.get("current_person", 0)
     booking["people"][current]["weight"] = weight
 
-    # Проверка: есть ли лошадь, подходящая по весу
-    suitable = find_horse_for_weight(weight)
-    if not suitable:
+    # Если вес 95-105, проверить рост
+    height = booking["people"][current].get("height", 0)
+    if weight > WEIGHT_THRESHOLD and height < MIN_HEIGHT_FOR_HEAVY:
         await update.message.reply_text(
-            f"⚠️ К сожалению, у нас нет лошадей, подходящих для веса {weight} кг.\n"
-            "Максимальный вес всадника — 105 кг.",
+            f"⚠️ При весе более {WEIGHT_THRESHOLD} кг рост должен быть не менее {MIN_HEIGHT_FOR_HEAVY} см.\n\n"
+            f"📞 Позвоните нам по номеру {CONTACT_PHONE} —\n"
+            f"мы подберём для вас подходящую лошадь.",
+            reply_markup=main_menu(),
         )
+        context.user_data.clear()
+        return ConversationHandler.END
 
     await update.message.reply_text("Есть ли опыт верховой езды?", reply_markup=experience_menu())
     return PERSON_EXPERIENCE
@@ -716,7 +729,6 @@ async def experience_text_received(update: Update, context: ContextTypes.DEFAULT
 
 
 async def next_person_or_date(message, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Переход к следующему участнику или к выбору даты."""
     booking = context.user_data.setdefault("booking", {})
     current = booking.get("current_person", 0)
     count = booking.get("people_count", 1)
@@ -777,31 +789,50 @@ async def time_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     booking = context.user_data.setdefault("booking", {})
     booking["time"] = query.data.replace("time_", "")
 
-    await query.message.reply_text("Введите имя и фамилию:")
+    await query.message.reply_text("Введите ваше имя (только имя, без фамилии):")
     return NAME
 
 
 async def name_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    if len(text) < 2:
-        await update.message.reply_text("Введите имя и фамилию.")
+
+    if not is_valid_name(text):
+        await update.message.reply_text(
+            "Имя должно состоять только из букв (без цифр и символов).\n"
+            "Длина: от 2 до 50 символов.\n\n"
+            "Введите ваше имя:"
+        )
         return NAME
+
+    # Автоматически сделать первую букву заглавной
+    text = text.capitalize()
 
     booking = context.user_data.setdefault("booking", {})
     booking["name"] = text
 
-    await update.message.reply_text("Введите телефон в формате +79990000000:")
+    await update.message.reply_text(
+        "📱 Отправьте номер телефона, нажав на кнопку ниже:",
+        reply_markup=phone_keyboard(),
+    )
     return PHONE
 
 
 async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if len(text) < 10:
-        await update.message.reply_text("Введите корректный номер телефона.")
+    contact = update.message.contact
+
+    if not contact:
+        await update.message.reply_text(
+            "Пожалуйста, отправьте номер телефона через кнопку ниже:",
+            reply_markup=phone_keyboard(),
+        )
         return PHONE
 
+    phone = contact.phone_number
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
     booking = context.user_data.setdefault("booking", {})
-    booking["phone"] = text
+    booking["phone"] = phone
 
     service_key = booking.get("service_key")
     people_count = len(booking.get("people", [])) or booking.get("people_count", 1)
@@ -816,6 +847,12 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "phone": booking.get("phone"),
         "people": booking.get("people", []),
     }
+
+    # Скрываем ReplyKeyboard и возвращаем InlineKeyboard
+    await update.message.reply_text(
+        "📞 Номер получен!",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     await update.message.reply_text(
         booking_summary(preview),
         reply_markup=confirm_menu(),
@@ -857,7 +894,6 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     add_booking(final_booking)
     context.user_data.clear()
 
-    # Памятка сразу после подтверждения
     await query.message.reply_text(note_text(), parse_mode="Markdown")
     await query.message.reply_text(
         "✅ Ваша заявка отправлена! Инструктор проверит данные и подтвердит запись.",
@@ -930,6 +966,7 @@ def build_app() -> Application:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, name_received),
             ],
             PHONE: [
+                MessageHandler(filters.CONTACT, phone_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received),
             ],
             CONFIRM: [
